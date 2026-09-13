@@ -1,8 +1,23 @@
 const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-const { askAI, askAIWithHistory, duckSearch, youtubeSearch } = require('./lib/functions');
+const { askAI, askAIWithHistory, duckSearch, youtubeSearch, MODELS } = require('./lib/functions');
 const { Sticker, StickerTypes } = require('wa-sticker-formatter');
 const fs = require('fs');
 const path = require('path');
+
+// ── Générateur de menu des modèles ───────────────────────────────────────────
+function generateModelsList(activeAlias) {
+    let result = '';
+    const providers = [...new Set(MODELS.map(m => m.provider))];
+    providers.forEach(prov => {
+        result += `\n 🤖 *${prov.toUpperCase()}* :\n`;
+        const provModels = MODELS.filter(m => m.provider === prov);
+        provModels.forEach(m => {
+            const activeStr = m.alias === activeAlias ? ' ← actif' : '';
+            result += `  • ${m.name} (alias: *${m.alias}*)${activeStr}\n`;
+        });
+    });
+    return result.trim();
+}
 
 let botActive = true;
 let currentPrefix = '.'; // Préfixe par défaut
@@ -24,11 +39,13 @@ function normalizeJid(jid) {
 }
 
 
-// ── Mode Groq Alive (IA suit la conversation) ────────────────────────────────
+// ── Mode IA Alive (IA suit la conversation) ───────────────────────────────────
 // groqAliveChats : Set des JIDs où le mode alive est actif
 // groqHistory    : Map<jid, Array<{role, content}>> — historique par chat
+// iaModelPerChat : Map<jid, string> — modèle IA choisi par chat ('groq'|'gemini'|'nvidia')
 const groqAliveChats = new Set();
 const groqHistory = new Map();
+const iaModelPerChat = new Map();
 const HISTORY_LIMIT = 20; // nombre max de messages (user+assistant) conservés
 
 // Mots-clés qui signalent qu'un message mérite une réponse de l'IA
@@ -251,7 +268,7 @@ module.exports = async (sock, m) => {
         const body = extractBody(msg.message);
         if (!body) return;
 
-        // ── Interception des messages en mode Groq Alive ──────────────────
+        // ── Interception des messages en mode IA Alive ────────────────────
         // Ce bloc doit être AVANT le filtre commandes
         if (!body.startsWith(currentPrefix) && groqAliveChats.has(from)) {
             const text = body.trim();
@@ -261,11 +278,12 @@ module.exports = async (sock, m) => {
                 if (!groqHistory.has(from)) groqHistory.set(from, []);
                 const hist = groqHistory.get(from);
                 hist.push({ role: 'user', content: text });
-                const reply = await askAIWithHistory(hist);
-                if (reply) {
-                    hist.push({ role: 'assistant', content: reply });
+                const modelAlias = iaModelPerChat.get(from) || 'g8';
+                const result = await askAIWithHistory(hist, modelAlias);
+                if (result?.text) {
+                    hist.push({ role: 'assistant', content: result.text });
                     if (hist.length > HISTORY_LIMIT) hist.splice(0, hist.length - HISTORY_LIMIT);
-                    await sock.sendMessage(from, { text: `👻 ${reply}` });
+                    await sock.sendMessage(from, { text: `👻 ${result.text}` });
                 }
             }
             return;
@@ -423,6 +441,8 @@ module.exports = async (sock, m) => {
 
             // ── HELP ─────────────────────────────────────────────────────
             case 'help': {
+                const currentAlias = iaModelPerChat.get(from) || 'g8';
+                const modelsList = generateModelsList(currentAlias);
                 const menu = [
                     '╭─ 👻 *PHANTOM BOT*',
                     '│ ⚡ _Gardien du Ghost Zone_ ⚡',
@@ -438,10 +458,15 @@ module.exports = async (sock, m) => {
                     ` ├ ⋆ *${currentPrefix}auth* ➜ Autorise un contact`,
                     ` ╰ ⋆ *${currentPrefix}ret* ➜ Retire les droits`,
                     '',
-                    ' 🌀 *DIMENSION SAVOIR*',
-                    ` ├ ⋆ *${currentPrefix}groq* _<txt>_ ➜ IA directe`,
-                    ` ├ ⋆ *${currentPrefix}groq alive* ➜ 🟢 Chat IA`,
-                    ` ╰ ⋆ *${currentPrefix}groq dead* ➜ 🔴 Stop Chat`,
+                    ' 🤖 *INTELLIGENCE SPECTRALE*',
+                    ` ├ ⋆ *${currentPrefix}ia <question>* ➜ IA (modèle actif)`,
+                    ` ├ ⋆ *${currentPrefix}ia <alias>* ➜ Changer le modèle`,
+                    ` ├ ⋆ *${currentPrefix}ia alive* ➜ 🟢 Chat IA automatique`,
+                    ` ├ ⋆ *${currentPrefix}ia dead* ➜ 🔴 Stop Chat IA`,
+                    ` ╰ ⋆ *${currentPrefix}ia reset* ➜ Efface mémoire`,
+                    '',
+                    ` 🔹 *Modèles dispo* :`,
+                    modelsList,
                     '',
                     ' 🎵 *FRÉQUENCES SPECTRALES*',
                     ` ├ ⋆ *${currentPrefix}play* _<titre>_ ➜ Aperçu`,
@@ -481,77 +506,116 @@ module.exports = async (sock, m) => {
                 break;
             }
 
-            // ── GROQ ─────────────────────────────────────────────────────
-            case 'groq': {
-                const subCmd = query.trim().toLowerCase();
+            // ── IA ───────────────────────────────────────────────────────
+            case 'ia': {
+                const trimmedQuery = query.trim();
+                const firstWord = trimmedQuery.split(/\s+/)[0]?.toLowerCase() || '';
 
-                // ── .groq alive ───────────────────────────────────────────
-                if (subCmd === 'alive') {
+                // ── .ia alive ─────────────────────────────────────────────
+                if (firstWord === 'alive') {
                     groqAliveChats.add(from);
                     if (!groqHistory.has(from)) groqHistory.set(from, []);
+                    
+                    const alias = iaModelPerChat.get(from) || 'g8';
+                    const activeModelObj = MODELS.find(m => m.alias === alias) || MODELS[0];
+
                     return sock.sendMessage(from, {
                         text: [
-                            '⚡ *Mode Groq Alive activé !* 👻',
+                            `⚡ *Mode IA Alive activé !* 👻`,
+                            `🤖 _Modèle actif : *${activeModelObj.name}*_`,
                             '',
-                            '_Je lis maintenant vos messages et je réponds aux questions automatiquement._',
-                            '_Posez-moi une question directement sans commande !_',
+                            '_Je lis vos messages et réponds aux questions automatiquement._',
+                            '_Si les tokens s\'épuisent, je bascule sur le modèle suivant tout seul !_',
                             '',
-                            '🔴 Tape *.groq dead* pour me faire taire.'
+                            `🔴 Tape *${currentPrefix}ia dead* pour me faire taire.`
                         ].join('\n')
                     });
                 }
 
-                // ── .groq dead ────────────────────────────────────────────
-                if (subCmd === 'dead' || subCmd === 'off') {
+                // ── .ia dead ──────────────────────────────────────────────
+                if (firstWord === 'dead' || firstWord === 'off') {
                     groqAliveChats.delete(from);
-                    groqHistory.delete(from); // Efface l'historique
+                    groqHistory.delete(from);
                     return sock.sendMessage(from, {
-                        text: '🔴 *Mode Groq Alive désactivé.*\n_Je ne lis plus vos messages automatiquement._'
+                        text: '🔴 *Mode IA Alive désactivé.*\n_Je ne lis plus vos messages automatiquement._'
                     });
                 }
 
-                // ── .groq reset ───────────────────────────────────────────
-                if (subCmd === 'reset') {
+                // ── .ia reset ─────────────────────────────────────────────
+                if (firstWord === 'reset') {
                     groqHistory.delete(from);
                     return sock.sendMessage(from, {
                         text: '🧠 *Mémoire effacée !*\n_L\'IA repart de zéro pour cette conversation._'
                     });
                 }
 
-                // ── .groq <question> — mode question directe ─────────────
-                if (!query) return sock.sendMessage(from, {
-                    text: [
-                        '🌀 *Portail incomplet !*',
-                        'Usage : *.groq <ta question>*',
-                        '',
-                        'Sous-commandes :',
-                        '  *.groq alive*  — Active la discussion automatique',
-                        '  *.groq dead*   — Désactive la discussion',
-                        '  *.groq reset*  — Efface la mémoire IA'
-                    ].join('\n')
-                });
+                // ── .ia <alias> → changer le modèle (query = exactement un alias)
+                const targetModel = MODELS.find(m => m.alias === firstWord);
+                if (targetModel && firstWord === trimmedQuery.toLowerCase()) {
+                    iaModelPerChat.set(from, firstWord);
+                    return sock.sendMessage(from, {
+                        text: [
+                            `✅ *Modèle IA changé !*`,
+                            `🤖 _Actif : *${targetModel.name}*_`,
+                            '',
+                            `_Tape *${currentPrefix}ia <question>* pour poser une question._`,
+                            `_Tape *${currentPrefix}ia alive* pour le mode conversation._`,
+                            `_Si ce modèle est à court de tokens, je bascule automatiquement._`
+                        ].join('\n')
+                    });
+                }
 
+                // ── .ia sans argument → aide + modèle actuel
+                if (!trimmedQuery) {
+                    const activeAlias = iaModelPerChat.get(from) || 'g8';
+                    const list = generateModelsList(activeAlias);
+                    return sock.sendMessage(from, {
+                        text: [
+                            '🤖 *Intelligence Spectrale — Phantom Bot*',
+                            '',
+                            '🔹 *Modèles disponibles (tape l\'alias pour changer) :*',
+                            list,
+                            '',
+                            `🔹 *Commandes :*`,
+                            `  *${currentPrefix}ia <question>*  — Poser une question`,
+                            `  *${currentPrefix}ia <alias>*     — Choisir le modèle (ex: .ia gp)`,
+                            `  *${currentPrefix}ia alive*       — Chat auto (mode conversation)`,
+                            `  *${currentPrefix}ia dead*        — Stop chat`,
+                            `  *${currentPrefix}ia reset*       — Efface la mémoire IA`,
+                            '',
+                            '_Si le modèle actif est à court de tokens, je bascule sur le suivant automatiquement._'
+                        ].join('\n')
+                    });
+                }
+
+                // ── .ia <question> → réponse avec modèle actif + fallback auto
                 await sock.sendMessage(from, { text: '🔮 _Phantom plonge dans les dimensions du savoir..._' });
+                const activeAlias = iaModelPerChat.get(from) || 'g8';
+                const activeModelObj = MODELS.find(m => m.alias === activeAlias) || MODELS[0];
+                const result = await askAI(trimmedQuery, activeAlias);
 
-                const aiAnswer = await askAI(query);
-
-                if (aiAnswer) {
+                if (result?.text) {
+                    const fell = result.modelName !== activeModelObj.name;
+                    const tag = fell
+                        ? ` [⚡ basculé sur ${result.modelName}]`
+                        : ` [${result.modelName}]`;
                     await sock.sendMessage(from, {
                         text: [
-                            `╔══ 👻 *PHANTOM RÉPOND*`,
-                            `╠══ ❓ _${query}_`,
+                            `╔══ 👻 *PHANTOM RÉPOND*${tag}`,
+                            `╠══ ❓ _${trimmedQuery}_`,
                             `╠══`,
-                            `║ ${aiAnswer.replace(/\n/g, '\n║ ')}`,
+                            `║ ${result.text.replace(/\n/g, '\n║ ')}`,
                             `╚══════════════════════`,
                             `⚡ _Réponse spectrale de Phantom Bot_`
                         ].join('\n')
                     });
                 } else {
-                    const results = await duckSearch(query);
+                    // Fallback DuckDuckGo si tous les providers IA ont échoué
+                    const results = await duckSearch(trimmedQuery);
                     if (!results || !results.length) {
-                        return sock.sendMessage(from, { text: '💀 _Aucune trace dans le Ghost Zone._' });
+                        return sock.sendMessage(from, { text: '💀 _Aucune trace dans le Ghost Zone. Tous les modèles IA sont indisponibles._' });
                     }
-                    let text = `╔══ 🌀 *SCAN SPECTRAL : "${query}"*\n`;
+                    let text = `╔══ 🌀 *SCAN SPECTRAL : "${trimmedQuery}"*\n`;
                     results.slice(0, 3).forEach((res, i) => {
                         const num = ['1️⃣', '2️⃣', '3️⃣'][i];
                         text += `╠══\n║ ${num} *${res.title}*\n`;
@@ -563,6 +627,7 @@ module.exports = async (sock, m) => {
                 }
                 break;
             }
+
 
             // ── PLAY ─────────────────────────────────────────────────────
             case 'play': {
