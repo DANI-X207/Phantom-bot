@@ -3,6 +3,7 @@ const { askAI, askAIWithHistory, duckSearch, youtubeSearch, MODELS } = require('
 const { Sticker, StickerTypes } = require('wa-sticker-formatter');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 
 // ── Générateur de menu des modèles ───────────────────────────────────────────
 function generateModelsList(activeAlias) {
@@ -52,7 +53,8 @@ const HISTORY_LIMIT = 20; // nombre max de messages (user+assistant) conservés
 const QUESTION_PATTERNS = [
     /\?/,                                              // point d'interrogation
     /^(c'est quoi|qu'est[-\s]ce|pourquoi|comment|quand|où|qui|combien|est[-\s]ce|tu peux|tu sais|explique|dis[-\s]moi|parle[-\s]moi|c'est quoi|keskon|kske|kc|kv|c kwa|c koi)/i,
-    /\b(aide|help|info|définis|signifie|veut dire|traduction|traduis|calcul|fait combien)\b/i
+    /^(what|how|why|when|where|who|can you|could you|please|tell me|explain)/i,
+    /\b(aide|help|info|définis|signifie|veut dire|traduction|traduis|traduire|translate|calcul|fait combien|phantom|bot|stp)\b/i
 ];
 
 const MEDIA_KEYS = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'];
@@ -122,7 +124,6 @@ async function downloadYoutubeVideo(query) {
         noPlaylist: true,
         noCheckCertificates: true,
         limitRate: '2M',
-        extractorArgs: 'youtube:player_client=android,web',
         addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0'],
         format: '18/best' // 18 = 360p mp4 avec audio/vidéo intégrés (pas besoin de ffmpeg)
     };
@@ -257,10 +258,12 @@ async function downloadModern(url, prefix, format) {
     await youtubedl(url, {
         output: `${tmpBase}.%(ext)s`,
         format,
+        // YouTube exige désormais l'exécution du player JavaScript pour
+        // exposer certains formats. Node est déjà le runtime du bot.
+        jsRuntimes: 'node',
         noPlaylist: true,
         noCheckCertificates: true,
         limitRate: '2M',
-        extractorArgs: 'youtube:player_client=android,web',
         addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0']
     });
     return findDownloadedFile(tmpBase);
@@ -275,21 +278,84 @@ async function searchYoutubeModern(query, limit = 3) {
 async function downloadYoutubeVideoReliable(query) {
     const videos = await searchYoutubeModern(query);
     if (!videos.length) throw new Error('Aucun résultat YouTube trouvé.');
+
+    // Formats tentés dans l'ordre : du plus compatible (audio+vidéo) au dernier recours
+    const FORMATS = [
+        '22/18',                                                          // 1. Anciens formats combinés YouTube (audio+vidéo, le mieux)
+        'b[ext=mp4][acodec!=none][vcodec!=none]',                        // 2. Meilleur mp4 combiné disponible
+        'b[ext=mp4][vcodec^=avc]/bv[ext=mp4][vcodec^=avc]'              // 3. Dernier recours : vidéo H.264 seule (lisible mais sans son)
+    ];
+
     let lastError;
     for (const video of videos) {
-        try {
-            const file = await downloadModern(video.url, 'phantom_vid', 'best[ext=mp4][acodec!=none][vcodec!=none][height<=480]/best[acodec!=none][vcodec!=none][height<=480]');
-            const sizeMB = fs.statSync(file).size / (1024 * 1024);
-            if (sizeMB > 95) throw new Error(`Fichier trop lourd (${Math.round(sizeMB)}MB).`);
-            const buffer = fs.readFileSync(file);
-            try { fs.unlinkSync(file); } catch (_) { }
-            return { buffer, title: video.title, author: video.author?.name || 'Inconnu', duration: video.timestamp || '?', sizeMB: Math.round(sizeMB) };
-        } catch (error) {
-            lastError = error;
-            console.error(`[DVID] Échec ${video.url}:`, error.message);
+        for (const format of FORMATS) {
+            try {
+                console.log(`[DVID] Tentative format "${format}" pour ${video.url}`);
+                const file = await downloadModern(video.url, 'phantom_vid', format);
+                const sizeMB = fs.statSync(file).size / (1024 * 1024);
+                if (sizeMB > 95) { try { fs.unlinkSync(file); } catch (_) { } throw new Error(`Fichier trop lourd (${Math.round(sizeMB)}MB).`); }
+                const buffer = fs.readFileSync(file);
+                try { fs.unlinkSync(file); } catch (_) { }
+                console.log(`[DVID] ✅ Succès avec format "${format}"`);
+                return { buffer, title: video.title, author: video.author?.name || 'Inconnu', duration: video.timestamp || '?', sizeMB: Math.round(sizeMB) };
+            } catch (error) {
+                lastError = error;
+                console.error(`[DVID] Format "${format}" échoué pour ${video.url}:`, error.message);
+            }
         }
     }
     throw lastError || new Error('Aucune vidéo téléchargeable.');
+}
+
+async function downloadYoutubeAudioToBuffer(url) {
+    const { spawn } = require('child_process');
+    const youtubedl = require('youtube-dl-exec');
+    const flags = {
+        output: '-',
+        format: 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
+        jsRuntimes: 'node',
+        noPlaylist: true,
+        noCheckCertificates: true,
+        limitRate: '2M',
+        noProgress: true,
+        addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0']
+    };
+
+    return new Promise((resolve, reject) => {
+        const child = spawn(youtubedl.constants.YOUTUBE_DL_PATH, [...youtubedl.args(flags), '--', url], {
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        const chunks = [];
+        const errors = [];
+        let size = 0;
+        const maxSize = 64 * 1024 * 1024;
+
+        child.stdout.on('data', chunk => {
+            size += chunk.length;
+            if (size > maxSize) {
+                child.kill();
+                reject(new Error('Audio trop lourd pour WhatsApp (64 Mo maximum).'));
+                return;
+            }
+            chunks.push(chunk);
+        });
+        child.stderr.on('data', chunk => errors.push(chunk));
+        child.on('error', reject);
+        child.on('close', code => {
+            if (size > maxSize) return;
+            if (code !== 0) return reject(new Error(Buffer.concat(errors).toString('utf8').trim() || `yt-dlp a quitté avec le code ${code}`));
+            resolve(Buffer.concat(chunks));
+        });
+    });
+}
+
+function detectAudioMime(buffer) {
+    if (buffer.subarray(0, 3).toString() === 'ID3' || (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0)) return 'audio/mpeg';
+    if (buffer.subarray(0, 4).toString() === 'OggS') return 'audio/ogg; codecs=opus';
+    if (buffer.subarray(0, 4).toString() === 'RIFF') return 'audio/wav';
+    if (buffer.subarray(4, 8).toString() === 'ftyp') return 'audio/mp4';
+    return 'audio/webm';
 }
 
 async function downloadYoutubeAudioReliable(query) {
@@ -298,11 +364,8 @@ async function downloadYoutubeAudioReliable(query) {
     let lastError;
     for (const video of videos) {
         try {
-            const file = await downloadModern(video.url, 'phantom_audio', 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio');
-            const ext = path.extname(file).toLowerCase();
-            const mimetype = ext === '.mp3' ? 'audio/mpeg' : ext === '.webm' ? 'audio/webm' : ext === '.ogg' || ext === '.opus' ? 'audio/ogg; codecs=opus' : 'audio/mp4';
-            const buffer = fs.readFileSync(file);
-            try { fs.unlinkSync(file); } catch (_) { }
+            const buffer = await downloadYoutubeAudioToBuffer(video.url);
+            const mimetype = detectAudioMime(buffer);
             return { buffer, mimetype, title: video.title || query, author: video.author?.name || 'Inconnu', duration: video.timestamp || '?' };
         } catch (error) {
             lastError = error;
@@ -346,9 +409,16 @@ module.exports = async (sock, m, { sessionId = 'super', sessionManager = null } 
         // ── Interception des messages en mode IA Alive ────────────────────
         // Ce bloc doit être AVANT le filtre commandes
         if (!body.startsWith(currentPrefix) && groqAliveChats.has(from)) {
-            const text = body.trim();
-            const wordCount = text.split(/\s+/).length;
-            const isQuestion = wordCount >= 2 && QUESTION_PATTERNS.some(p => p.test(text));
+            let text = body.trim();
+            const quotedMsg = msg.message && msg.message.extendedTextMessage && msg.message.extendedTextMessage.contextInfo && msg.message.extendedTextMessage.contextInfo.quotedMessage;
+            if (quotedMsg) {
+                const quotedText = quotedMsg.conversation || (quotedMsg.extendedTextMessage && quotedMsg.extendedTextMessage.text) || (quotedMsg.imageMessage && quotedMsg.imageMessage.caption) || (quotedMsg.videoMessage && quotedMsg.videoMessage.caption) || "";
+                if (quotedText) {
+                    text = 'Message cite :\n"' + quotedText + '"\n\nMa question : ' + text;
+                }
+            }
+            const wordCount = body.trim().split(/\s+/).length;
+            const isQuestion = (wordCount >= 2 && QUESTION_PATTERNS.some(p => p.test(body.trim()))) || (quotedMsg && wordCount >= 1);
             if (isQuestion) {
                 if (!groqHistory.has(from)) groqHistory.set(from, []);
                 const hist = groqHistory.get(from);
@@ -415,7 +485,9 @@ module.exports = async (sock, m, { sessionId = 'super', sessionManager = null } 
             if (!query) return sock.sendMessage(from, { text: `⚠️ *Numéro manquant.*\n_Usage : ${currentPrefix}uncouple <numéro>_` });
             const result = await sessionManager.disconnectByNumber(query);
             if (!result.ok) {
-                const text = result.reason === 'ambiguous'
+                const text = result.reason === 'super-protected'
+                    ? '👑 *Action refusée.* La super-session ne peut pas être déconnectée avec cette commande.'
+                    : result.reason === 'ambiguous'
                     ? '⚠️ Plusieurs sessions correspondent à ce numéro. Saisis le numéro complet avec son indicatif.'
                     : '⚠️ Aucune session couplée ne correspond à ce numéro. Utilise *.info* pour voir les numéros.';
                 return sock.sendMessage(from, { text });
@@ -553,8 +625,6 @@ module.exports = async (sock, m, { sessionId = 'super', sessionManager = null } 
 
             // ── HELP ─────────────────────────────────────────────────────
             case 'help': {
-                const currentAlias = iaModelPerChat.get(from) || 'g8';
-                const modelsList = generateModelsList(currentAlias);
                 const menu = [
                     ...(isSuperUser ? [
                         '👑 *SUPER-SESSION*',
@@ -584,13 +654,18 @@ module.exports = async (sock, m, { sessionId = 'super', sessionManager = null } 
                     ` ├ ⋆ *${currentPrefix}ia dead* ➜ 🔴 Stop Chat IA`,
                     ` ╰ ⋆ *${currentPrefix}ia reset* ➜ Efface mémoire`,
                     '',
-                    ` 🔹 *Modèles dispo* :`,
-                    modelsList,
                     '',
                     ' 🎵 *FRÉQUENCES SPECTRALES*',
                     ` ├ ⋆ *${currentPrefix}play* _<titre>_ ➜ Aperçu`,
                     ` ├ ⋆ *${currentPrefix}daudio* _<titre>_ ➜ Audio`,
                     ` ╰ ⋆ *${currentPrefix}dvid* _<titre>_ ➜ Vidéo`,
+                    '',
+                    ' 🎤 *VOIX SPECTRALE*',
+                    ` ├ ⋆ *${currentPrefix}tts* _<texte>_ ➜ Texte en audio`,
+                    ` ╰ ⋆ *${currentPrefix}stt* ➜ Transcrit un audio`,
+                    '',
+                    ' 🎨 *CRÉATION SPECTRALE*',
+                    ` ╰ ⋆ *${currentPrefix}img* _<description>_ ➜ Génère une image`,
                     '',
                     ' 💀 *ARTEFACTS FANTÔMES*',
                     ` ├ ⋆ *${currentPrefix}save* ➜ Vole vue unique`,
@@ -1034,8 +1109,157 @@ module.exports = async (sock, m, { sessionId = 'super', sessionManager = null } 
 
                 break;
             }
+            // -- TTS --
+            case 'tts': {
+                // Récupère le texte depuis la commande ou depuis le message cité.
+                const quotedForTts = msg.message && msg.message.extendedTextMessage && msg.message.extendedTextMessage.contextInfo && msg.message.extendedTextMessage.contextInfo.quotedMessage;
+                const getQuotedText = (quoted) => {
+                    if (!quoted || typeof quoted !== 'object') return '';
+                    if (quoted.ephemeralMessage) return getQuotedText(quoted.ephemeralMessage.message);
+                    if (quoted.viewOnceMessageV2) return getQuotedText(quoted.viewOnceMessageV2.message);
+                    return quoted.conversation
+                        || quoted.extendedTextMessage?.text
+                        || quoted.imageMessage?.caption
+                        || quoted.videoMessage?.caption
+                        || quoted.documentMessage?.caption
+                        || '';
+                };
+                const ttsText = String(query || getQuotedText(quotedForTts)).trim();
+
+                if (!ttsText) return sock.sendMessage(from, {
+                    text: [
+                        '🎙️ *Texte manquant !*',
+                        'Usage : *.tts <texte>*',
+                        '_Ou reponds a un message texte avec_ *.tts*'
+                    ].join('\n')
+                });
+                await sock.sendMessage(from, { text: '🎙️ _Phantom synthétise la voix..._' });
+                try {
+                    // StreamElements renvoie désormais 401 sans authentification.
+                    // Google Translate TTS ne demande pas de clé pour cette synthèse.
+                    const ttsRes = await axios.get('https://translate.google.com/translate_tts', {
+                        params: {
+                            ie: 'UTF-8',
+                            client: 'tw-ob',
+                            tl: 'fr',
+                            q: ttsText.slice(0, 200)
+                        },
+                        responseType: 'arraybuffer',
+                        timeout: 30000,
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0',
+                            Referer: 'https://translate.google.com/'
+                        }
+                    });
+                    if (!ttsRes.data || !ttsRes.data.byteLength) throw new Error('réponse audio vide');
+                    await sock.sendMessage(from, { audio: Buffer.from(ttsRes.data), mimetype: 'audio/mpeg', ptt: false });
+                } catch (ttsErr) {
+                    console.error('[TTS ERROR]', ttsErr.message);
+                    await sock.sendMessage(from, { text: '💀 _TTS impossible :_ ' + ttsErr.message });
+                }
+                break;
+            }
+
+            // -- STT --
+            case 'stt': {
+                const quotedForStt = msg.message && msg.message.extendedTextMessage && msg.message.extendedTextMessage.contextInfo && msg.message.extendedTextMessage.contextInfo.quotedMessage;
+                const audioMsg = (msg.message && msg.message.audioMessage) || (quotedForStt && quotedForStt.audioMessage);
+                if (!audioMsg) return sock.sendMessage(from, { text: '🎤 *Aucun vocal trouvé !*\n\n💡 Réponds à un message vocal avec *.stt*' });
+                await sock.sendMessage(from, { text: '🎤 _Phantom transcrit le vocal..._' });
+                try {
+                    const apiContent = fs.readFileSync(path.join(__dirname, 'api.txt'), 'utf8');
+                    const groqMatch = apiContent.match(/groq\s+api\s*:\s*(.+)/i);
+                    if (!groqMatch) throw new Error('Clé Groq introuvable dans api.txt');
+                    const groqKey = groqMatch[1].trim();
+                    const audioBuffer = await downloadMedia(audioMsg, 'audio');
+                    const os2 = require('os');
+                    const tmpAudio = path.join(os2.tmpdir(), 'phantom_stt_' + Date.now() + '.ogg');
+                    fs.writeFileSync(tmpAudio, audioBuffer);
+                    const FormData = require('form-data');
+                    const form = new FormData();
+                    form.append('file', fs.createReadStream(tmpAudio), { filename: 'audio.ogg', contentType: 'audio/ogg' });
+                    form.append('model', 'whisper-large-v3');
+                    const sttHeaders = Object.assign({}, form.getHeaders(), { 'Authorization': 'Bearer ' + groqKey });
+                    const sttRes = await axios.post('https://api.groq.com/openai/v1/audio/transcriptions', form, { headers: sttHeaders, timeout: 60000 });
+                    try { fs.unlinkSync(tmpAudio); } catch (_) {}
+                    const transcription = sttRes.data && sttRes.data.text && sttRes.data.text.trim();
+                    if (!transcription) throw new Error('Transcription vide.');
+                    await sock.sendMessage(from, { text: '🎤 *Transcription :*\n\n_' + transcription + '_\n\n👻 _Phantom Bot_ ⚡' });
+                } catch (sttErr) {
+                    console.error('[STT ERROR]', sttErr.message);
+                    await sock.sendMessage(from, { text: '💀 _Transcription impossible :_ ' + sttErr.message });
+                }
+                break;
+            }
+
+            // ── IMG ──────────────────────────────────────────────────────
+            case 'img': {
+                if (!query) return sock.sendMessage(from, {
+                    text: [
+                        '🎨 *Prompt manquant !*',
+                        'Usage : *.img <description>*',
+                        '',
+                        '_Exemples :_',
+                        '➜ .img un chat astronaute dans l\'espace',
+                        '➜ .img paysage cyberpunk au coucher du soleil',
+                        '➜ .img portrait d\'un samouraï fantôme',
+                    ].join('\n')
+                });
+
+                await sock.sendMessage(from, { text: '🎨 _Phantom invoque l\'image depuis le Ghost Zone..._' });
+
+                try {
+                    const apiContent = fs.readFileSync(path.join(__dirname, 'api.txt'), 'utf8');
+                    const nvidiaMatch = apiContent.match(/^\s*nvidia\s+api\s*:\s*(.+)\s*$/im);
+                    if (!nvidiaMatch) throw new Error('Clé NVIDIA introuvable dans api.txt');
+
+                    const imgResponse = await axios.post(
+                        'https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-dev',
+                        {
+                            prompt: query,
+                            width: 1024,
+                            height: 1024,
+                            cfg_scale: 5,
+                            mode: 'base',
+                            samples: 1,
+                            seed: Math.floor(Math.random() * 2147483647),
+                            steps: 30
+                        },
+                        {
+                            timeout: 120000,
+                            headers: {
+                                Authorization: `Bearer ${nvidiaMatch[1].trim()}`,
+                                Accept: 'application/json',
+                                'Content-Type': 'application/json'
+                            }
+                        }
+                    );
+
+                    const imageBase64 = imgResponse.data?.artifacts?.[0]?.base64;
+                    if (!imageBase64) throw new Error('réponse image NVIDIA invalide');
+                    const imgBuffer = Buffer.from(imageBase64, 'base64');
+                    await sock.sendMessage(from, {
+                        image: imgBuffer,
+                        mimetype: 'image/jpeg',
+                        caption: `🎨 *${query}*\n👻 _Généré par Phantom Bot_ ⚡`
+                    });
+                } catch (imgErr) {
+                    console.error('[IMG ERROR]', imgErr.message);
+                    await sock.sendMessage(from, {
+                        text: [
+                            '💀 _Génération impossible._',
+                            '',
+                            `⚠️ _Raison : ${imgErr.message}_`,
+                            '',
+                            '💡 *Essaie avec un prompt plus simple.*'
+                        ].join('\n')
+                    });
+                }
+                break;
+            }
 
             // ── DEFAULT ──────────────────────────────────────────────────
+
             default:
                 await sock.sendMessage(from, {
                     text: `👻 *Commande inconnue :* _${currentPrefix}${command}_\n⚡ Tape *${currentPrefix}help* pour voir le portail.`
@@ -1049,3 +1273,4 @@ module.exports = async (sock, m, { sessionId = 'super', sessionManager = null } 
         } catch (_) { }
     }
 };
+
