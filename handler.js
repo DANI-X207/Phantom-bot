@@ -237,7 +237,82 @@ async function downloadYoutubeAudio(query) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-module.exports = async (sock, m) => {
+// Version robuste : yt-search est déjà utilisé par .play et yt-dlp télécharge
+// des flux modernes, au lieu du format YouTube historique 18.
+function findDownloadedFile(tmpBase) {
+    const dir = path.dirname(tmpBase);
+    const prefix = path.basename(tmpBase);
+    const files = fs.readdirSync(dir)
+        .filter(name => name.startsWith(prefix) && !name.endsWith('.part'))
+        .map(name => path.join(dir, name))
+        .filter(file => fs.statSync(file).isFile());
+    if (!files.length) throw new Error('yt-dlp n’a produit aucun fichier.');
+    return files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+}
+
+async function downloadModern(url, prefix, format) {
+    const youtubedl = require('youtube-dl-exec');
+    const os = require('os');
+    const tmpBase = path.join(os.tmpdir(), `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`);
+    await youtubedl(url, {
+        output: `${tmpBase}.%(ext)s`,
+        format,
+        noPlaylist: true,
+        noCheckCertificates: true,
+        limitRate: '2M',
+        extractorArgs: 'youtube:player_client=android,web',
+        addHeader: ['referer:youtube.com', 'user-agent:Mozilla/5.0']
+    });
+    return findDownloadedFile(tmpBase);
+}
+
+async function searchYoutubeModern(query, limit = 3) {
+    const yts = require('yt-search');
+    const result = await yts(query);
+    return (result.videos || []).slice(0, limit);
+}
+
+async function downloadYoutubeVideoReliable(query) {
+    const videos = await searchYoutubeModern(query);
+    if (!videos.length) throw new Error('Aucun résultat YouTube trouvé.');
+    let lastError;
+    for (const video of videos) {
+        try {
+            const file = await downloadModern(video.url, 'phantom_vid', 'best[ext=mp4][acodec!=none][vcodec!=none][height<=480]/best[acodec!=none][vcodec!=none][height<=480]');
+            const sizeMB = fs.statSync(file).size / (1024 * 1024);
+            if (sizeMB > 95) throw new Error(`Fichier trop lourd (${Math.round(sizeMB)}MB).`);
+            const buffer = fs.readFileSync(file);
+            try { fs.unlinkSync(file); } catch (_) { }
+            return { buffer, title: video.title, author: video.author?.name || 'Inconnu', duration: video.timestamp || '?', sizeMB: Math.round(sizeMB) };
+        } catch (error) {
+            lastError = error;
+            console.error(`[DVID] Échec ${video.url}:`, error.message);
+        }
+    }
+    throw lastError || new Error('Aucune vidéo téléchargeable.');
+}
+
+async function downloadYoutubeAudioReliable(query) {
+    const videos = await searchYoutubeModern(query);
+    if (!videos.length) throw new Error('Aucun résultat YouTube trouvé.');
+    let lastError;
+    for (const video of videos) {
+        try {
+            const file = await downloadModern(video.url, 'phantom_audio', 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio');
+            const ext = path.extname(file).toLowerCase();
+            const mimetype = ext === '.mp3' ? 'audio/mpeg' : ext === '.webm' ? 'audio/webm' : ext === '.ogg' || ext === '.opus' ? 'audio/ogg; codecs=opus' : 'audio/mp4';
+            const buffer = fs.readFileSync(file);
+            try { fs.unlinkSync(file); } catch (_) { }
+            return { buffer, mimetype, title: video.title || query, author: video.author?.name || 'Inconnu', duration: video.timestamp || '?' };
+        } catch (error) {
+            lastError = error;
+            console.error(`[DAUDIO] Échec ${video.url}:`, error.message);
+        }
+    }
+    throw lastError || new Error('Aucun audio téléchargeable.');
+}
+
+module.exports = async (sock, m, { sessionId = 'super', sessionManager = null } = {}) => {
     const msg = m.messages[0];
     const from = msg?.key?.remoteJid;
 
@@ -309,6 +384,43 @@ module.exports = async (sock, m) => {
             return sock.sendMessage(from, {
                 text: '🚨 *Accès refusé !*\n_Tu n\'es pas autorisé à utiliser les commandes de Phantom Bot._'
             });
+        }
+
+        // Les commandes de sessions sont réservées au propriétaire de la super-session.
+        const isSuperUser = Boolean(sessionManager?.isSuperSession(sessionId) && senderJid === normMyJid);
+        if (['couple', 'info', 'uncouple'].includes(command) && !isSuperUser) {
+            return sock.sendMessage(from, { text: '🚫 *Commande réservée à la super-session.*' });
+        }
+
+        if (command === 'couple') {
+            const id = await sessionManager.createCoupledSession(from);
+            return sock.sendMessage(from, {
+                text: `⏳ *Préparation d'une nouvelle session (${id})...*\n_Le QR sera envoyé ici dès qu'il sera généré._`
+            });
+        }
+
+        if (command === 'info') {
+            const connected = sessionManager.listSessions();
+            const lines = connected.map((entry, index) => {
+                const role = entry.super ? '👑 Super-session' : '🔗 Session couplée';
+                const number = entry.number ? `+${entry.number}` : 'Numéro en attente';
+                return `${index + 1}. ${role}\n   ${number} — _${entry.status}_`;
+            });
+            return sock.sendMessage(from, {
+                text: `📡 *Sessions Phantom (${connected.length})*\n\n${lines.join('\n\n') || '_Aucune session active._'}\n\n_Utilise ${currentPrefix}uncouple <numéro> pour déconnecter une session couplée._`
+            });
+        }
+
+        if (command === 'uncouple') {
+            if (!query) return sock.sendMessage(from, { text: `⚠️ *Numéro manquant.*\n_Usage : ${currentPrefix}uncouple <numéro>_` });
+            const result = await sessionManager.disconnectByNumber(query);
+            if (!result.ok) {
+                const text = result.reason === 'ambiguous'
+                    ? '⚠️ Plusieurs sessions correspondent à ce numéro. Saisis le numéro complet avec son indicatif.'
+                    : '⚠️ Aucune session couplée ne correspond à ce numéro. Utilise *.info* pour voir les numéros.';
+                return sock.sendMessage(from, { text });
+            }
+            return sock.sendMessage(from, { text: `✅ *Session déconnectée.*\n_+${result.session.number} a été retiré du bot._` });
         }
 
         if (command === 'setprefix') {
@@ -444,6 +556,13 @@ module.exports = async (sock, m) => {
                 const currentAlias = iaModelPerChat.get(from) || 'g8';
                 const modelsList = generateModelsList(currentAlias);
                 const menu = [
+                    ...(isSuperUser ? [
+                        '👑 *SUPER-SESSION*',
+                        ` • *${currentPrefix}couple* ➜ Connecter un compte`,
+                        ` • *${currentPrefix}info* ➜ Voir les sessions`,
+                        ` • *${currentPrefix}uncouple <numéro>* ➜ Déconnecter un compte`,
+                        ''
+                    ] : []),
                     '╭─ 👻 *PHANTOM BOT*',
                     '│ ⚡ _Gardien du Ghost Zone_ ⚡',
                     '╰────────────── ✧',
@@ -673,7 +792,7 @@ module.exports = async (sock, m) => {
                 await sock.sendMessage(from, { text: '🎵 _Phantom vole l\'audio depuis YouTube..._' });
 
                 try {
-                    const result = await downloadYoutubeAudio(query);
+                    const result = await downloadYoutubeAudioReliable(query);
                     await sock.sendMessage(from, {
                         text: `🎵 _Envoi de :_ *${result.title}* par *${result.author}* _(${result.duration})_`
                     });
@@ -730,7 +849,7 @@ module.exports = async (sock, m) => {
 
                         await youtubedl(query, {
                             // Pas de fusion → pas de ffmpeg
-                            format: '18/best',
+                            format: 'best[ext=mp4][acodec!=none][vcodec!=none][height<=480]/best[acodec!=none][vcodec!=none][height<=480]',
                             output: tmpFile,
                             noPlaylist: true,
                             noCheckCertificates: true,
@@ -757,7 +876,7 @@ module.exports = async (sock, m) => {
 
                     } else {
                         // Recherche YouTube par titre
-                        result = await downloadYoutubeVideo(query);
+                        result = await downloadYoutubeVideoReliable(query);
                     }
 
                     await sock.sendMessage(from, {
