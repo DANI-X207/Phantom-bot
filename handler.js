@@ -1213,31 +1213,81 @@ module.exports = async (sock, m, { sessionId = 'super', sessionManager = null } 
                     const nvidiaMatch = apiContent.match(/^\s*nvidia\s+api\s*:\s*(.+)\s*$/im);
                     if (!nvidiaMatch) throw new Error('Clé NVIDIA introuvable dans api.txt');
 
-                    const imgResponse = await axios.post(
-                        'https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-dev',
-                        {
-                            prompt: query,
-                            width: 1024,
-                            height: 1024,
-                            cfg_scale: 5,
-                            mode: 'base',
-                            samples: 1,
-                            seed: Math.floor(Math.random() * 2147483647),
-                            steps: 30
-                        },
-                        {
-                            timeout: 120000,
-                            headers: {
-                                Authorization: `Bearer ${nvidiaMatch[1].trim()}`,
-                                Accept: 'application/json',
-                                'Content-Type': 'application/json'
-                            }
+                    let translatedPrompt = query;
+                    try {
+                        const groqMatch = apiContent.match(/^\s*groq\s+api\s*:\s*(.+)\s*$/im);
+                        if (groqMatch) {
+                            const enhancement = await axios.post(
+                                'https://api.groq.com/openai/v1/chat/completions',
+                                {
+                                    model: 'llama3-8b-8192',
+                                    temperature: 0.1,
+                                    messages: [
+                                        {
+                                            role: 'system',
+                                            content: 'Rewrite the user request as a detailed English image-generation prompt. Preserve every named person, object, action and requested visual style exactly. For public figures and fictional characters, add recognizable canonical facial features, hairstyle, outfit and identifying traits while keeping their names. Use the canonical art style of fictional characters unless another style is requested. Make the requested action visibly explicit and central. If it is a fight, show a dynamic action battle with both characters attacking or defending; never make them merely stand facing each other. Reply with only the English prompt.'
+                                        },
+                                        { role: 'user', content: query }
+                                    ]
+                                },
+                                {
+                                    timeout: 30000,
+                                    headers: {
+                                        Authorization: `Bearer ${groqMatch[1].trim()}`,
+                                        'Content-Type': 'application/json'
+                                    }
+                                }
+                            );
+                            const translated = enhancement.data?.choices?.[0]?.message?.content?.trim();
+                            if (translated) translatedPrompt = translated;
                         }
-                    );
+                    } catch (_) { }
 
-                    const imageBase64 = imgResponse.data?.artifacts?.[0]?.base64;
-                    if (!imageBase64) throw new Error('réponse image NVIDIA invalide');
-                    const imgBuffer = Buffer.from(imageBase64, 'base64');
+                    const imagePrompt = [
+                        `Create exactly this scene: ${translatedPrompt}.`,
+                        'Clearly show the precise requested action and every named person.',
+                        'Do not replace the requested action with an unrelated activity or a simple portrait.',
+                        'Preserve any requested artistic style; otherwise use high-quality photorealistic editorial photography, coherent composition and natural lighting.'
+                    ].join(' ');
+
+                    let imgBuffer;
+                    let usedFallback = false;
+                    try {
+                        const imgResponse = await axios.post(
+                            'https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-dev',
+                            {
+                                prompt: imagePrompt,
+                                width: 1024,
+                                height: 1024,
+                                cfg_scale: 5,
+                                mode: 'base',
+                                samples: 1,
+                                seed: Math.floor(Math.random() * 2147483647),
+                                steps: 30
+                            },
+                            {
+                                timeout: 120000,
+                                headers: {
+                                    Authorization: `Bearer ${nvidiaMatch[1].trim()}`,
+                                    Accept: 'application/json',
+                                    'Content-Type': 'application/json'
+                                }
+                            }
+                        );
+
+                        const artifact = imgResponse.data?.artifacts?.[0];
+                        if (artifact?.finishReason === 'CONTENT_FILTERED') {
+                            throw new Error('CONTENT_FILTERED');
+                        }
+                        const imageBase64 = artifact?.base64;
+                        if (!imageBase64) throw new Error('réponse image NVIDIA invalide');
+                        imgBuffer = Buffer.from(imageBase64, 'base64');
+                    } catch (fallbackErr) {
+                        console.log(`[IMG] NVIDIA a échoué (${fallbackErr.message}), basculement sur Pollinations...`);
+                        usedFallback = true;
+                        const pollRes = await axios.get(`https://image.pollinations.ai/prompt/${encodeURIComponent(imagePrompt)}?width=1024&height=1024&nologo=true`, { responseType: 'arraybuffer', timeout: 60000 });
+                        imgBuffer = Buffer.from(pollRes.data);
+                    }
                     await sock.sendMessage(from, {
                         image: imgBuffer,
                         mimetype: 'image/jpeg',

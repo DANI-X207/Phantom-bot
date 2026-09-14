@@ -107,10 +107,10 @@ function listSessions() {
 async function disconnectByNumber(rawNumber) {
     const wanted = String(rawNumber || '').replace(/\D/g, '');
     const superSession = sessions.get(registry.superSessionId);
-    if (superSession?.number && (superSession.number === wanted || superSession.number.endsWith(wanted))) {
+    if (superSession?.number && (superSession.number === wanted || superSession.number.startsWith(wanted))) {
         return { ok: false, reason: 'super-protected' };
     }
-    const candidates = [...sessions.values()].filter(record => record.id !== registry.superSessionId && record.number && (record.number === wanted || record.number.endsWith(wanted)));
+    const candidates = [...sessions.values()].filter(record => record.id !== registry.superSessionId && record.number && (record.number === wanted || record.number.startsWith(wanted)));
     if (candidates.length !== 1) return { ok: false, reason: candidates.length ? 'ambiguous' : 'not-found' };
     const record = candidates[0];
     record.manuallyStopped = true;
